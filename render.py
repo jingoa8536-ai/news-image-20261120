@@ -244,7 +244,7 @@ def render():
          "GAZA TANKS CROSS THE YELLOW LINE · GOLD FALLS 5%",
          (60, 908, 964, 948), BOLD, 15, color=PAPER, align="center", valign="center")
     text("Compiled from Reuters, One Turn, Citizen's Daily Brief and The Wire Post — 20 November 2026.",
-         (48, 959, 976, 976), SANS, 13, color=GREY, align="center")
+         (48, 962, 976, 976), SANS, 13, color=GREY, align="center")
 
     output = Path(__file__).resolve().with_name("frontpage.png")
     page.image.save(output, optimize=True)
