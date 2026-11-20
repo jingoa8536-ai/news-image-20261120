@@ -1,15 +1,15 @@
-"""Copy the rendered entry to the required output location."""
+"""Export the bundled front page for the bounty runner."""
 
 from pathlib import Path
-import shutil
+from shutil import copyfile
 
 
 def main():
-    source = Path(__file__).resolve().parent / 'frontpage.png'
-    destination = Path('/output/entry.png')
+    source = Path(__file__).resolve().with_name("frontpage.png")
+    destination = Path("/output/entry.png")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(source, destination)
+    copyfile(source, destination)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

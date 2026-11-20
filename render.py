@@ -1,162 +1,259 @@
-"""Render the supplied 20 November 2026 news digest with Pillow."""
+"""Typeset the fixed 20 November 2026 front page with Pillow."""
 
+from functools import lru_cache
+from hashlib import sha256
 from pathlib import Path
-import math
 
 from PIL import Image, ImageDraw, ImageFont
 
 
-ROOT = Path(__file__).resolve().parent
-FONT_DIR = Path('/usr/share/fonts/truetype/dejavu')
-PAPER = '#f6f1e7'
-INK = '#16191d'
-RED = '#b0232a'
-BLUE = '#33566b'
-GREY = '#686963'
-image = Image.new('RGB', (1024, 1024), PAPER)
-draw = ImageDraw.Draw(image)
-regions = []
+SIZE = 1024
+MARGIN = 48
+PAGE = (MARGIN, MARGIN, SIZE - MARGIN, SIZE - MARGIN)
+PAPER, INK, RED, BLUE, GREY = "#f6f1e7", "#16191d", "#b0232a", "#33566b", "#686963"
+FONT_DIR = Path("/usr/share/fonts/truetype/dejavu")
+TRANSFORM = getattr(Image, "Transform", Image)
+RESAMPLING = getattr(Image, "Resampling", Image)
+SERIF = "DejaVuSerif-Bold"
+BOLD = "DejaVuSans-Bold"
+SANS = "DejaVuSans"
+ITALIC = "DejaVuSans-Oblique"
+
+GRID = (
+    (
+        "DIPLOMACY",
+        "Trump, Xi, Putin Sign Peace\nPledge in Shenzhen",
+        "The first three-way summit ended in a four-point\n"
+        "declaration on nuclear risk, UN reform and energy —\n"
+        "silent on Ukraine and Iran.",
+    ),
+    (
+        "MARKETS",
+        "Anthropic Soars 17% in\nRecord Nasdaq Debut",
+        "Shares opened at $111.50 against an $83 offer price, but AI doubts "
+        "dragged world stocks lower; the Nikkei fell 4.8%.",
+    ),
+    (
+        "INDIA — WEATHER",
+        "Cyclone Akvan Slams\nthe Odisha Coast",
+        "The third cyclone in a month came ashore near Gopalpur with gusts "
+        "to 100 km/h; about 300,000 people were evacuated.",
+    ),
+    (
+        "JUSTICE — THE HAGUE",
+        "World Court: Myanmar\nCommitted Genocide",
+        "The ICJ ruled that Myanmar's campaign against the Rohingya was "
+        "genocide — its first such finding against a state.",
+    ),
+)
 
 
-def font(name, size):
-    path = FONT_DIR / (name + '.ttf')
-    if not path.exists() and name == 'DejaVuSans-Oblique':
-        path = FONT_DIR / 'DejaVuSans.ttf'
-    return ImageFont.truetype(str(path), size)
+def contains(outer, inner):
+    return (outer[0] <= inner[0] < inner[2] <= outer[2]
+            and outer[1] <= inner[1] < inner[3] <= outer[3])
 
 
-def wrap(text, face, width):
+def overlaps(a, b):
+    return (max(a[0], b[0]) < min(a[2], b[2])
+            and max(a[1], b[1]) < min(a[3], b[3]))
+
+
+@lru_cache(maxsize=None)
+def font_for(face, size):
+    path = FONT_DIR / f"{face}.ttf"
+    synthetic = face == ITALIC and not path.is_file()
+    if synthetic:
+        path = FONT_DIR / f"{SANS}.ttf"
+    return ImageFont.truetype(str(path), size), synthetic
+
+
+def line_mask(text, font, synthetic):
+    """Return an exact ink mask and its top offset from the baseline."""
+    left, top, right, bottom = font.getbbox(text, anchor="ls")
+    height = bottom - top
+    pad = (height + 3) // 4 + 2 if synthetic else 0
+    mask = Image.new("L", (right - left + pad, height))
+    ImageDraw.Draw(mask).text((-left, -top), text, font=font, fill=255, anchor="ls")
+    if synthetic:
+        mask = mask.transform(mask.size, TRANSFORM.AFFINE,
+                              (1, .23, -.23 * height, 0, 1, 0),
+                              resample=RESAMPLING.BICUBIC)
+    bounds = mask.getbbox()
+    if bounds is None:
+        raise ValueError(f"No visible glyphs in {text!r}")
+    return mask.crop(bounds), top + bounds[1]
+
+
+def wrap(text, font, width):
     lines = []
-    line = ''
-    for word in text.split():
-        candidate = f'{line} {word}'.strip()
-        if draw.textbbox((0, 0), candidate, font=face)[2] > width and line:
-            lines.append(line)
-            line = word
-        else:
-            line = candidate
-    if line:
+    for paragraph in text.splitlines():
+        line = ""
+        for word in paragraph.split():
+            candidate = f"{line} {word}" if line else word
+            left, _, right, _ = font.getbbox(candidate)
+            if line and right - left > width:
+                lines.append(line)
+                line = word
+            else:
+                line = candidate
         lines.append(line)
     return lines
 
 
-def measure(text, name, size, width, max_lines=100):
-    face = font(name, size)
-    lines = wrap(text, face, width)
-    step = size + max(2, round(size * .12))
-    boxes = [draw.textbbox((0, 0), line, font=face) for line in lines]
-    height = (len(lines) - 1) * step + max(b[3] - b[1] for b in boxes)
-    fits = len(lines) <= max_lines and all(b[2] - min(0, b[0]) <= width for b in boxes)
-    return face, lines, boxes, step, height, fits
+class FrontPage:
+    def __init__(self):
+        self.image = Image.new("RGB", (SIZE, SIZE), PAPER)
+        self.draw = ImageDraw.Draw(self.image)
+        self.text_rectangles = []
+
+    def text(self, copy, box, face, size, *, color=INK, align="left",
+             wrap_words=False, min_size=11, valign="top"):
+        if not contains(PAGE, box):
+            raise ValueError(f"Text box outside the {MARGIN}px margin: {copy!r} {box}")
+        x0, y0, x1, y1 = box
+        width, height = x1 - x0, y1 - y0
+
+        for points in range(size, min_size - 1, -1):
+            font, synthetic = font_for(face, points)
+            lines = wrap(copy, font, width) if wrap_words else copy.splitlines()
+            pitch = (points * 6 + 4) // 5
+            masks = []
+            for index, line in enumerate(lines):
+                mask, baseline_offset = line_mask(line, font, synthetic)
+                masks.append((mask, index * pitch + baseline_offset))
+            top = min(y for _, y in masks)
+            bottom = max(y + mask.height for mask, y in masks)
+            if bottom - top <= height and all(mask.width <= width for mask, _ in masks):
+                break
+        else:
+            raise ValueError(f"Unable to fit {copy!r} in {box} at {min_size}px or larger")
+
+        origin_y = y0 - top
+        if valign == "center":
+            origin_y += (height - (bottom - top)) // 2
+        for line, (mask, offset) in zip(lines, masks):
+            x = {"left": x0, "center": x0 + (width - mask.width) // 2,
+                 "right": x1 - mask.width}[align]
+            y = origin_y + offset
+            rect = (x, y, x + mask.width, y + mask.height)
+            if not contains(box, rect) or not contains(PAGE, rect):
+                raise AssertionError(f"Text escaped its box or the page margin: {line!r} {rect}")
+            for previous, previous_rect in self.text_rectangles:
+                if overlaps(rect, previous_rect):
+                    raise AssertionError(f"Text overlaps: {line!r} {rect} and "
+                                         f"{previous!r} {previous_rect}")
+            self.text_rectangles.append((line, rect))
+            self.image.paste(color, (x, y), mask)
+
+    def rule(self, y, color=INK, width=1):
+        self.draw.line((48, y, 975, y), fill=color, width=width)
 
 
-def text_block(text, box, name, preferred, color=INK, max_lines=100, center=False):
-    x, y, width, height = box
-    for size in range(preferred, 6, -1):
-        face, lines, boxes, step, used, fits = measure(text, name, size, width, max_lines)
-        if fits and used <= height:
-            break
-    else:
-        raise ValueError(f'Text cannot fit: {text}')
-    for i, (line, bounds) in enumerate(zip(lines, boxes)):
-        left = x + (width - (bounds[2] - bounds[0])) / 2 if center else x
-        position = (left - bounds[0], y + i * step - bounds[1])
-        actual = draw.textbbox(position, line, font=face)
-        assert actual[0] >= x and actual[2] <= x + width, (text, actual, box)
-        assert actual[1] >= y and actual[3] <= y + height, (text, actual, box)
-        assert 48 <= actual[0] and actual[2] <= 976
-        assert 48 <= actual[1] and actual[3] <= 976
-        draw.text(position, line, font=face, fill=color)
-        regions.append((actual, text))
-    return used
+def bridge_band():
+    """Draw the schematic at triple resolution for smooth edges."""
+    width, height, scale = 928, 137, 3
+    art = Image.new("RGB", (width * scale, height * scale), "#e3e9e7")
+    draw = ImageDraw.Draw(art)
+
+    def polygon(points, color):
+        draw.polygon([(x * scale, y * scale) for x, y in points], fill=color)
+
+    def line(points, color, weight=1):
+        draw.line([(x * scale, y * scale) for x, y in points],
+                  fill=color, width=weight * scale, joint="curve")
+
+    def curve(points):
+        a, b, c, d = points
+        return [tuple(((32 - t) ** 3 * a[i] + 3 * (32 - t) ** 2 * t * b[i]
+                       + 3 * (32 - t) * t ** 2 * c[i] + t ** 3 * d[i]) / 32 ** 3
+                      for i in (0, 1)) for t in range(33)]
+
+    upper_bank = ((0, 39), (211, 5), (527, 96), (928, 49))
+    lower_bank = ((0, 119), (274, 88), (593, 166), (928, 116))
+    polygon(curve(upper_bank) + curve(lower_bank)[::-1], BLUE)
+    for shift, color in ((10, "#91a7b2"), (20, "#678596"), (48, "#678596"),
+                         (58, "#91a7b2")):
+        line(curve(tuple((x, y + shift) for x, y in upper_bank)), color)
+
+    for center, deck_y, strike in ((171, 56, -35), (462, 62, 29), (753, 65, -16)):
+        half_span = 91
+        left, right = center - half_span, center + half_span
+        arch = curve(((left + 11, deck_y + 48), (center - 39, deck_y - 9),
+                      (center + 39, deck_y - 9), (right - 11, deck_y + 48)))
+        for x in (left + 11, right - 11):
+            line(((x, deck_y), (x, deck_y + 56)), "#223c4d", 9)
+        line(arch, "#223c4d", 12)
+        line(arch, PAPER, 6)
+        line(((left, deck_y + 3), (right, deck_y + 3)), "#223c4d", 10)
+        line(((left, deck_y), (right, deck_y)), PAPER, 5)
+        for x in (left + 32, center, right - 32):
+            end = deck_y + (9 if x == center else 21)
+            line(((x, deck_y + 3), (x, end)), PAPER, 2)
+
+        x, y = center + strike, deck_y - 5
+        burst = ((0, -19), (4, -7), (15, -11), (8, -2), (20, 3), (7, 6),
+                 (11, 17), (1, 11), (-6, 19), (-7, 8), (-19, 10), (-11, 1),
+                 (-18, -8), (-6, -6))
+        polygon([(x + dx, y + dy) for dx, dy in burst], RED)
+        polygon(((x, y - 4), (x + 5, y + 1), (x, y + 6), (x - 5, y + 1)), PAPER)
+
+    return art.resize((width, height), RESAMPLING.LANCZOS)
 
 
-def story(kicker, headline, deck, x, y, width, height):
-    # Scale the whole story together so its hierarchy survives the tight grid.
-    for scale in range(100, 35, -1):
-        sizes = [round(n * scale / 100) for n in (20, 33, 22)]
-        specifications = [(kicker, 'DejaVuSans-Bold', sizes[0], 1),
-                          (headline, 'DejaVuSerif-Bold', sizes[1], 3),
-                          (deck, 'DejaVuSans', sizes[2], 100)]
-        measures = [measure(t, f, s, width, limit) for t, f, s, limit in specifications]
-        if all(m[-1] for m in measures) and sum(m[4] for m in measures) + 14 <= height:
-            break
-    else:
-        raise ValueError(f'Story cannot fit: {headline}')
-    for (text, name, size, limit), measured, color in zip(
-            specifications, measures, (RED, INK, INK)):
-        used = text_block(text, (x, y, width, measured[4]), name, size, color, limit)
-        y += used + 7
+def render():
+    page = FrontPage()
+    text = page.text
+    page.rule(49, RED, 3)
+    text("THE WORLD IN ONE DAY", (48, 61, 976, 126), SERIF, 69, align="center")
+    page.rule(133, INK, 2)
+    text("FRIDAY · 20 NOVEMBER 2026", (48, 143, 430, 162), BOLD, 15, color=BLUE)
+    text("The day in full — six stories, one page", (512, 142, 976, 162), ITALIC,
+         16, color=GREY, align="right")
+    page.rule(167, GREY)
+
+    text("UKRAINE — THE WAR", (48, 183, 976, 203), BOLD, 16, color=RED)
+    text("Missiles Shatter Kyiv's Bridges", (48, 211, 976, 263), SERIF, 57)
+    text("Russia's biggest barrage of the war — nearly 100 missiles and some 400 drones — "
+         "smashed three bridges over the Dnipro, killed three people and cut power across the capital.",
+         (48, 274, 976, 320), SANS, 22, wrap_words=True)
+    page.image.paste(bridge_band(), (48, 328))
+    text("The Podilsko-Voskresenskyi, Darnytskyi and Pivdennyi bridges were all hit before dawn.",
+         (48, 473, 976, 492), ITALIC, 15, color=GREY)
+
+    for y in (501, 649, 797):
+        page.rule(y, INK if y != 649 else GREY)
+    page.draw.line((511, 512, 511, 639), fill=GREY)
+    page.draw.line((511, 659, 511, 786), fill=GREY)
+    for index, (kicker, headline, deck) in enumerate(GRID):
+        left, right = ((48, 490), (533, 976))[index % 2]
+        y = (512, 660)[index // 2]
+        text(kicker, (left, y, right, y + 16), BOLD, 14, color=RED)
+        text(headline, (left, y + 23, right, y + 83), SERIF, 28)
+        text(deck, (left, y + 87, right, y + 132), SANS, 16, wrap_words=True)
+
+    page.draw.rectangle((48, 807, 975, 897), fill="#e8e9e1")
+    page.draw.rectangle((48, 807, 52, 897), fill=RED)
+    text("MIDDLE EAST", (64, 816, 960, 831), BOLD, 14, color=RED)
+    text("Houthi Missile Damages Riyadh's PIF Tower", (64, 836, 960, 862), SERIF, 29)
+    text("Missiles struck the Saudi capital's financial district as the Iran war ground into its ninth month;\n"
+         "President Trump deferred any new strikes to next year.",
+         (64, 865, 960, 893), SANS, 15, wrap_words=True)
+
+    page.draw.rectangle((48, 905, 975, 950), fill="#000000")
+    text("KENYA DISCHARGES ITS LAST EBOLA PATIENT · TWO TRAINS COLLIDE IN PRAGUE — 46 HURT ·\n"
+         "GAZA TANKS CROSS THE YELLOW LINE · GOLD FALLS 5%",
+         (60, 908, 964, 948), BOLD, 15, color=PAPER, align="center", valign="center")
+    text("Compiled from Reuters, One Turn, Citizen's Daily Brief and The Wire Post — 20 November 2026.",
+         (48, 959, 976, 976), SANS, 13, color=GREY, align="center")
+
+    output = Path(__file__).resolve().with_name("frontpage.png")
+    page.image.save(output, optimize=True)
+    data = output.read_bytes()
+    if len(data) > 1024 ** 2:
+        raise ValueError(f"{output.name} exceeds 1 MiB: {len(data)} bytes")
+    print(f"{output.name}: {len(data)} bytes")
+    print(f"sha256: {sha256(data).hexdigest()}")
 
 
-text_block('FRIDAY · 20 NOVEMBER 2026', (48, 48, 928, 18),
-           'DejaVuSans-Bold', 17, center=True, max_lines=1)
-text_block('THE WORLD IN ONE DAY', (48, 79, 928, 61),
-           'DejaVuSerif-Bold', 88, center=True, max_lines=1)
-draw.rectangle((48, 148, 976, 152), fill=INK)
-text_block('The day in full — six stories, one page', (48, 164, 928, 23),
-           'DejaVuSans-Oblique', 24, center=True, max_lines=1)
-
-text_block('UKRAINE — THE WAR', (48, 205, 928, 18), 'DejaVuSans-Bold', 20, RED)
-text_block("Missiles Shatter Kyiv's Bridges", (48, 237, 928, 105),
-           'DejaVuSerif-Bold', 60, max_lines=2)
-text_block("Russia's biggest barrage of the war — nearly 100 missiles and some 400 drones — "
-           'smashed three bridges over the Dnipro, killed three people and cut power across the capital.',
-           (48, 302, 928, 58), 'DejaVuSans', 25)
-
-# A schematic river and three bridges; the impacts use fixed geometry.
-draw.rectangle((48, 373, 976, 453), fill='#e8e3d9')
-draw.rectangle((48, 390, 976, 437), fill=BLUE)
-for cx in (220, 512, 804):
-    draw.rectangle((cx - 60, 380, cx + 60, 443), fill=PAPER)
-    draw.rectangle((cx - 48, 390, cx + 48, 437), fill=BLUE)
-    draw.arc((cx - 49, 378, cx + 49, 436), 180, 360, fill=INK, width=4)
-    draw.line((cx - 61, 412, cx + 61, 412), fill=INK, width=4)
-    for dx in (-32, 0, 32):
-        draw.line((cx + dx, 389 if dx else 381, cx + dx, 411), fill=INK, width=2)
-    points = []
-    for i in range(16):
-        angle = i * math.pi / 8
-        radius = 16 if i % 2 == 0 else 6
-        points.append((cx + 23 + math.cos(angle) * radius, 397 + math.sin(angle) * radius))
-    draw.polygon(points, fill=RED)
-text_block('The Podilsko-Voskresenskyi, Darnytskyi and Pivdennyi bridges were all hit before dawn.',
-           (48, 461, 928, 18), 'DejaVuSans', 19, max_lines=1)
-
-draw.line((48, 491, 976, 491), fill=INK, width=2)
-draw.line((512, 501, 512, 744), fill='#bab8af', width=1)
-draw.line((48, 622, 976, 622), fill='#bab8af', width=1)
-stories = [
-    ('DIPLOMACY', 'Trump, Xi, Putin Sign Peace Pledge in Shenzhen',
-     'The first three-way summit ended in a four-point declaration on nuclear risk, UN reform and energy — silent on Ukraine and Iran.'),
-    ('MARKETS', 'Anthropic Soars 17% in Record Nasdaq Debut',
-     'Shares opened at $111.50 against an $83 offer price, but AI doubts dragged world stocks lower; the Nikkei fell 4.8%.'),
-    ('INDIA — WEATHER', 'Cyclone Akvan Slams the Odisha Coast',
-     'The third cyclone in a month came ashore near Gopalpur with gusts to 100 km/h; about 300,000 people were evacuated.'),
-    ('JUSTICE — THE HAGUE', 'World Court: Myanmar Committed Genocide',
-     "The ICJ ruled that Myanmar's campaign against the Rohingya was genocide — its first such finding against a state."),
-]
-for i, contents in enumerate(stories):
-    story(*contents, 48 + (i % 2) * 484, 503 + (i // 2) * 132, 444, 109)
-
-draw.line((48, 756, 976, 756), fill=INK, width=2)
-text_block('MIDDLE EAST', (48, 768, 928, 14), 'DejaVuSans-Bold', 17, RED)
-text_block("Houthi Missile Damages Riyadh's PIF Tower", (48, 790, 928, 29),
-           'DejaVuSerif-Bold', 36, max_lines=1)
-text_block("Missiles struck the Saudi capital's financial district as the Iran war ground into its ninth "
-           'month; President Trump deferred any new strikes to next year.',
-           (48, 826, 928, 33), 'DejaVuSans', 23, max_lines=2)
-
-draw.rectangle((48, 870, 976, 934), fill=INK)
-text_block('KENYA DISCHARGES ITS LAST EBOLA PATIENT · TWO TRAINS COLLIDE IN PRAGUE — 46 HURT · '
-           'GAZA TANKS CROSS THE YELLOW LINE · GOLD FALLS 5%',
-           (61, 878, 902, 48), 'DejaVuSans-Bold', 21, PAPER, max_lines=2, center=True)
-text_block("Compiled from Reuters, One Turn, Citizen's Daily Brief and The Wire Post — 20 November 2026.",
-           (48, 943, 928, 20), 'DejaVuSans', 17, GREY, max_lines=1, center=True)
-
-# Check the actual glyph rectangles across every text block before writing.
-for i, (a, label) in enumerate(regions):
-    for b, other in regions[i + 1:]:
-        assert not (a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]), (label, other)
-image.save(ROOT / 'frontpage.png', optimize=True)
-print('Rendered frontpage.png; all text bounds and overlap checks passed.')
+if __name__ == "__main__":
+    render()
